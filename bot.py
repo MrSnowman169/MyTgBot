@@ -2,26 +2,85 @@
 # Telegram бот: показывает анкету при /start и пересылает все сообщения админу
 
 import os
+import threading # Для работы 24/7 на Replit
+from flask import Flask # Для работы 24/7 на Replit
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # === Настройки ===
-BOT_TOKEN = "8370546925:AAFaP7bQCG_HBqZ3duloO2yA7T96vXZho1g"  # токен вставляется в Render
-ADMIN_ID = 6115320432  # ← твой Telegram ID (админ)
+# Считываем из переменных окружения (Secrets Replit)
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
+ADMIN_ID_STR = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ Укажи BOT_TOKEN в настройках Render (переменная окружения).")
+    raise SystemExit("❌ Укажи BOT_TOKEN в переменных окружения (Secrets).")
+
+if not ADMIN_ID_STR or not ADMIN_ID_STR.isdigit():
+    raise SystemExit("❌ Укажи ADMIN_ID в переменных окружения (Secrets).")
+
+ADMIN_ID = int(ADMIN_ID_STR)
+
+# === Временное хранилище для ЧС (Не сохраняется после перезапуска!) ===
+BLACKLISTED_USER_IDS = set() 
+# Если нужен постоянный черный список, нужно использовать базу данных или файл.
+# ---------------------------------------------------------------------
+
+
+# === Команда /cs (Черный список) ===
+async def blacklist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ управляет черным списком. ID берется из аргументов команды."""
+    
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        # Показать текущий список
+        if BLACKLISTED_USER_IDS:
+            await update.message.reply_text(
+                f"🚫 Текущий ЧС (ID пользователей): {', '.join(map(str, BLACKLISTED_USER_IDS))}"
+            )
+        else:
+            await update.message.reply_text("🚫 Черный список пуст. Для добавления: /cs ID_пользователя")
+        return
+
+    try:
+        # Пытаемся получить ID из аргумента команды
+        user_id = int(context.args[0])
+        
+        if user_id in BLACKLISTED_USER_IDS:
+            BLACKLISTED_USER_IDS.remove(user_id)
+            action = "разблокирован"
+        else:
+            BLACKLISTED_USER_IDS.add(user_id)
+            action = "заблокирован"
+            
+        await update.message.reply_text(
+            f"✅ Пользователь с ID **{user_id}** {action}. Сообщения от него {'больше не будут' if action == 'заблокирован' else 'снова будут'} пересылаться.",
+            parse_mode='Markdown'
+        )
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат. Используйте: /cs ID_пользователя. ID берется из пересланного сообщения."
+        )
+
 
 # === Команда /start ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # --- ПРОВЕРКА ЧС ---
+    if user.id in BLACKLISTED_USER_IDS:
+        await update.message.reply_text("🚫 Вы не можете использовать этого бота.")
+        return
+    # -------------------
 
     # --- анкетный текст (можно изменить как хочешь) ---
     text = (
         f"👋 Привет, {user.first_name or ''}!\n\n"
         "📋 Это бот анкеты.\n\n"
         "Пожалуйста, укажи свои данные:\n"
-        "1️⃣ Имя и возраст\n"
+        "1️⃣ 1Имя и возраст\n"
         "2️⃣ Город проживания\n"
         "3️⃣ Чем увлекаешься?\n"
         "4️⃣ Почему решил написать?\n\n"
@@ -45,6 +104,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === пересылка сообщений от пользователей админу ===
 async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # --- ПРОВЕРКА ЧС ---
+    if user.id in BLACKLISTED_USER_IDS:
+        return # Игнорируем сообщение от заблокированного пользователя
+    # -------------------
+
     msg = update.message
 
     try:
@@ -66,6 +131,7 @@ async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ответы админа пользователям ===
 async def reply_from_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции не менялся) ...
     msg = update.message
     if update.effective_user.id != ADMIN_ID:
         return
@@ -108,16 +174,34 @@ async def reply_from_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Ошибка при отправке: {e}")
 
 
+# === Запуск Flask для 24/7 ===
+def run_flask():
+    """Запускает минимальный веб-сервер, чтобы Replit не выключал бот."""
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def keep_alive():
+        return "Bot is alive! (24/7 check)"
+        
+    # Replit использует порт 8080 для веб-сервисов
+    app.run(host="0.0.0.0", port=8080)
+
 # === запуск приложения ===
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cs", blacklist_user)) # Новый обработчик для ЧС
     app.add_handler(MessageHandler(filters.ALL & (~filters.User(ADMIN_ID)), forward_to_admin))
     app.add_handler(MessageHandler(filters.ALL & filters.User(ADMIN_ID), reply_from_admin))
 
-    print("✅ Бот запущен и работает 24/7 (если на Render).")
-    app.run_polling()
+    # --- Запуск Flask в отдельном потоке для 24/7 ---
+    threading.Thread(target=run_flask).start()
+    print("🌐 Запущен веб-сервер для поддержки 24/7.")
+    # --------------------------------------------------
+    
+    print("✅ Бот запущен и ждет команд.")
+    app.run_polling(poll_interval=1)
 
 
 if __name__ == "__main__":
